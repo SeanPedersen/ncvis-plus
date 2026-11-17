@@ -1,7 +1,7 @@
 # NCVis+
 
-2D projections with t-SNE-level local and global structure, 3–5× faster than t-SNE FFT and
-using less than half its memory at 512k points.
+2D projections with t-SNE-level local and global structure, 3.5–6× faster than t-SNE FFT and
+using a third of its memory at 512k points.
 
 NCVis+ is a fork of [NCVis](https://github.com/stat-ml/ncvis) (Artemenkov & Panov, 2020). It keeps NCVis's
 noise-contrastive objective and changes four things around it:
@@ -16,7 +16,7 @@ noise-contrastive objective and changes four things around it:
 from ncvis_plus import NCVisPlus
 
 Y = NCVisPlus(random_state=0).fit_transform(X)                 # balanced default
-Y = NCVisPlus(n_negative=20, random_state=0).fit_transform(X)  # higher local quality, ~1.6x the time
+Y = NCVisPlus(n_negative=20, random_state=0).fit_transform(X)  # higher local quality, ~1.5x the time
 ```
 
 ## Quality vs t-SNE
@@ -35,8 +35,8 @@ included. Every method gets a RINND graph: k = 90 for t-SNE, 15 for the others.
 |---|---|---|---|---|
 | openTSNE FFT | **0.970** | 0.168 | 242 s | 4.2 GB |
 | manifolds-rs t-SNE FFT | 0.968 | **0.188** | 73 s | 5.6 GB |
-| **NCVis+ `n_negative=20`** | 0.962 | 0.175 | 32 s | 2.1 GB |
-| **NCVis+** | 0.955 | 0.174 | 20 s | 2.1 GB |
+| **NCVis+ `n_negative=20`** | 0.961 | 0.173 | 24 s | 1.9 GB |
+| **NCVis+** | 0.955 | 0.173 | 16 s | 1.9 GB |
 | NCVis 1.5.13 | 0.928 | 0.067 | 23 s | 1.8 GB |
 
 **`dbpedia-512-100k`** (512-d OpenAI text embeddings)
@@ -45,8 +45,8 @@ included. Every method gets a RINND graph: k = 90 for t-SNE, 15 for the others.
 |---|---|---|---|---|
 | openTSNE FFT | **0.984** | 0.278 | 79 s | 1.2 GB |
 | manifolds-rs t-SNE FFT | 0.983 | 0.284 | 21 s | 1.4 GB |
-| **NCVis+ `n_negative=20`** | 0.983 | 0.284 | 6.1 s | 0.8 GB |
-| **NCVis+** | 0.979 | **0.287** | 3.9 s | 0.8 GB |
+| **NCVis+ `n_negative=20`** | 0.982 | 0.285 | 4.8 s | 0.75 GB |
+| **NCVis+** | 0.978 | **0.288** | 3.3 s | 0.75 GB |
 | NCVis 1.5.13 | 0.963 | 0.234 | 3.9 s | 0.4 GB |
 
 **`jinaclip-512-1m`, 100k points**
@@ -55,15 +55,16 @@ included. Every method gets a RINND graph: k = 90 for t-SNE, 15 for the others.
 |---|---|---|---|---|
 | openTSNE FFT | **0.958** | 0.202 | 83 s | 1.6 GB |
 | manifolds-rs t-SNE FFT | 0.957 | **0.214** | 15 s | 1.6 GB |
-| **NCVis+ `n_negative=20`** | 0.952 | 0.176 | 7.1 s | 0.8 GB |
-| **NCVis+** | 0.945 | 0.176 | 4.6 s | 0.8 GB |
+| **NCVis+ `n_negative=20`** | 0.951 | 0.177 | 5.6 s | 0.75 GB |
+| **NCVis+** | 0.944 | 0.176 | 4.1 s | 0.75 GB |
 | NCVis 1.5.13 | 0.922 | 0.109 | 4.4 s | 0.4 GB |
 
 What the tables show:
 
 - **NCVis+ matches t-SNE's global structure on dbpedia.** At 512k it sits between openTSNE and
   manifolds-rs, within t-SNE's seed spread (sd 0.018). Stock NCVis keeps 40% of it at 512k.
-- **The default is 0.004–0.014 behind t-SNE locally.** `n_negative=20` halves that gap.
+- **The default is 0.006–0.015 behind t-SNE locally.** `n_negative=20` halves that gap.
+- **At 512k the default is faster than stock NCVis** (16 s vs 23 s), with all of the gains above.
 - **The exception is jinaclip at 100k,** where global stays at 0.176 against t-SNE's 0.21.
 
 Caveats:
@@ -72,8 +73,8 @@ Caveats:
   ([drbench](https://github.com/SeanPedersen/projection-benchmark)), and only two datasets have been tested so far.
 - **Stock NCVis was run with `min_dist` 0.1 and on the same RINND graph,** not with its own HNSW search.
 - **NCVis+ times were measured at a different time from the t-SNE times,** on the same host.
-- **The NCVis+ rows predate the block-of-8 kernel,** which makes the layout step 1.4× faster
-  (see below); end-to-end times have not been re-measured yet.
+- **NCVis+ rows:** drbench `ncvis-plus-rinnd-default` and `-n20-rinnd-default` at ncvis-plus
+  584c3a3, 3 seeds, on the cached RINND graph (its build time is included in the time column).
 - **How local is scored:** at 512k, and for NCVis+ at 100k, local is estimated on 10k fixed anchor
   points (ranks exact over all N). On stored t-SNE embeddings at 100k this matches exact scoring
   within 0.0005.
