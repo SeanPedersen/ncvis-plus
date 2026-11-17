@@ -1,12 +1,15 @@
 // NCVis+ core. See ncvis.hpp for the interface.
 //
-// Layout changes over stock NCVis 1.5.13 (same objective and update rule):
+// Layout changes over stock NCVis 1.5.13 (same objective):
 // - one powf per sample instead of two, none for the Cauchy kernel (a = b = 1);
 // - pcg32 with a multiply-shift range instead of pcg64 with std::uniform_int_distribution;
 // - a CSR graph with 32-bit targets instead of a vector of size_t pairs;
 // - the negatives of an edge are drawn up front and their rows prefetched. With every thread
 //   writing to random rows, the load of a negative's position otherwise stalls the loop on
-//   cross-core cache traffic (half of the loop's time in a profile at 100k x 36 threads).
+//   cross-core cache traffic (half of the loop's time in a profile at 100k x 36 threads);
+// - the samples of an edge are applied in blocks of 8 that share one snapshot of the source
+//   point and of Q, instead of one after the other: 1.4x faster layout at 100k-512k x 36 threads.
+//   At equal time (13-14 instead of 10 negatives) every quality score is equal or better.
 #include "ncvis.hpp"
 
 #include <omp.h>
@@ -104,8 +107,30 @@ Graph symmetrize(const int64_t *indices, size_t n_points, size_t k, int n_thread
     return graph;
 }
 
-void optimize(const Graph &graph, float *Y, size_t n_points, const LayoutParams &params) {
-    const size_t dim = params.dim;
+namespace {
+
+// Samples of an edge are processed in blocks that share one snapshot of yi and Q. Updating both
+// after every sample makes each sample wait on the previous one's powf, expf and divisions; the
+// blocks let the core overlap them. 8 keeps local quality within 0.001 of per-sample updates.
+constexpr uint32_t SNAPSHOT_BLOCK = 8;
+
+// Per-thread snapshot of yi and its accumulated shift. Fixed-size for the common dims, so the
+// compiler keeps it in registers; heap-backed for any other dim (DIM = 0).
+template <size_t DIM>
+struct Snapshot {
+    float yi[DIM], delta[DIM];
+    explicit Snapshot(size_t) {}
+};
+
+template <>
+struct Snapshot<0> {
+    std::vector<float> yi, delta;
+    explicit Snapshot(size_t dim) : yi(dim), delta(dim) {}
+};
+
+template <size_t DIM>
+void optimize_dim(const Graph &graph, float *Y, size_t n_points, const LayoutParams &params) {
+    const size_t dim = DIM ? DIM : params.dim;
     const float a = params.a, b = params.b;
     const bool cauchy = (a == 1.f && b == 1.f);
     const float min_d2 = 1e-12f;
@@ -113,9 +138,6 @@ void optimize(const Graph &graph, float *Y, size_t n_points, const LayoutParams 
     const size_t prefetch_ahead = 8;
     const size_t n_edges = graph.targets.size();
     const int n_epochs = (int)params.noise_plan.size();
-    if (n_points < 2 || n_edges == 0 || n_epochs == 0) {
-        return;
-    }
     const uint32_t max_noise = *std::max_element(params.noise_plan.begin(), params.noise_plan.end());
     const uint32_t *targets = graph.targets.data();
     const size_t *offsets = graph.offsets.data();
@@ -128,6 +150,7 @@ void optimize(const Graph &graph, float *Y, size_t n_points, const LayoutParams 
         pcg32 rng(params.seed, (uint64_t)omp_get_thread_num());
         const uint64_t n_points64 = n_points;
         std::vector<uint32_t> others(max_noise + 1);
+        Snapshot<DIM> snap(dim);
 
         for (int epoch = 0; epoch < n_epochs; ++epoch) {
             const float progress = (float)epoch / n_epochs;
@@ -151,36 +174,49 @@ void optimize(const Graph &graph, float *Y, size_t n_points, const LayoutParams 
                         others[s] = other;
                         __builtin_prefetch(Y + (size_t)other * dim);
                     }
-                    for (uint32_t s = 0; s <= n_noise; ++s) {
-                        float *yo = Y + (size_t)others[s] * dim;
-                        float d2 = 0;
+                    for (uint32_t block = 0; block <= n_noise; block += SNAPSHOT_BLOCK) {
+                        const uint32_t block_end = std::min(block + SNAPSHOT_BLOCK, n_noise + 1);
                         for (size_t c = 0; c < dim; ++c) {
-                            const float diff = yo[c] - yi[c];
-                            d2 += diff * diff;
+                            snap.yi[c] = yi[c];
+                            snap.delta[c] = 0.f;
                         }
-                        float q, kernel_grad;  // kernel_grad = 2ab q d2^(b-1)
-                        if (cauchy) {
-                            q = 1 / (1 + d2);
-                            kernel_grad = 2 * q;
-                        } else {
-                            const float d2_safe = d2 > min_d2 ? d2 : min_d2;
-                            const float d2_pow_b = powf(d2_safe, b);
-                            q = 1 / (1 + a * d2_pow_b);
-                            kernel_grad = 2 * a * b * q * d2_pow_b / d2_safe;
-                        }
-                        float w = 1.f;  // no negatives this epoch: plain attraction
-                        if (n_noise != 0) {
-                            const float ratio = q * inv_noise * expf(-Q_local);
-                            w = (s == 0) ? 1 / (1 + ratio) : -1 / (1 + 1 / ratio);
-                            Q_local -= w * params.learning_rate_Q;
-                            w *= kernel_grad;
+                        const float noise_scale = inv_noise * expf(-Q_local);
+                        float w_sum = 0.f;
+                        for (uint32_t s = block; s < block_end; ++s) {
+                            float *yo = Y + (size_t)others[s] * dim;
+                            float d2 = 0;
+                            for (size_t c = 0; c < dim; ++c) {
+                                const float diff = yo[c] - snap.yi[c];
+                                d2 += diff * diff;
+                            }
+                            float q, kernel_grad;  // kernel_grad = 2ab q d2^(b-1)
+                            if (cauchy) {
+                                q = 1 / (1 + d2);
+                                kernel_grad = 2 * q;
+                            } else {
+                                const float d2_safe = d2 > min_d2 ? d2 : min_d2;
+                                const float d2_pow_b = powf(d2_safe, b);
+                                q = 1 / (1 + a * d2_pow_b);
+                                kernel_grad = 2 * a * b * q * d2_pow_b / d2_safe;
+                            }
+                            float w = 1.f;  // no negatives this epoch: plain attraction
+                            if (n_noise != 0) {
+                                const float ratio = q * noise_scale;
+                                w = (s == 0) ? 1 / (1 + ratio) : -ratio / (1 + ratio);
+                                w_sum += w;
+                                w *= kernel_grad;
+                            }
+                            for (size_t c = 0; c < dim; ++c) {
+                                float shift = (yo[c] - snap.yi[c]) * w * step;
+                                shift = shift > max_shift ? max_shift : (shift < -max_shift ? -max_shift : shift);
+                                snap.delta[c] += shift;
+                                yo[c] -= shift;
+                            }
                         }
                         for (size_t c = 0; c < dim; ++c) {
-                            float shift = (yo[c] - yi[c]) * w * step;
-                            shift = shift > max_shift ? max_shift : (shift < -max_shift ? -max_shift : shift);
-                            yi[c] += shift;
-                            yo[c] -= shift;
+                            yi[c] += snap.delta[c];
                         }
+                        Q_local -= w_sum * params.learning_rate_Q;
                     }
                 }
             }
@@ -193,6 +229,19 @@ void optimize(const Graph &graph, float *Y, size_t n_points, const LayoutParams 
                 Q_sum = 0.f;
             }
         }
+    }
+}
+
+}  // namespace
+
+void optimize(const Graph &graph, float *Y, size_t n_points, const LayoutParams &params) {
+    if (n_points < 2 || graph.targets.empty() || params.noise_plan.empty()) {
+        return;
+    }
+    switch (params.dim) {
+        case 2: return optimize_dim<2>(graph, Y, n_points, params);
+        case 3: return optimize_dim<3>(graph, Y, n_points, params);
+        default: return optimize_dim<0>(graph, Y, n_points, params);
     }
 }
 

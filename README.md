@@ -8,7 +8,8 @@ noise-contrastive objective and changes four things around it:
 
 - **PCA initialization:** with random or spectral starts NCVis loses global structure as N grows.
 - **Retuned defaults:** `min_dist` 0.001, learning rate 2, twice the negative samples.
-- **A faster layout kernel:** the random negative rows are prefetched, plus a cheaper kernel and RNG.
+- **A faster layout kernel:** the random negative rows are prefetched, an edge's samples are applied
+  in blocks of 8 instead of one by one, plus a cheaper kernel and RNG.
 - **RINND as the default kNN graph.**
 
 ```python
@@ -71,6 +72,8 @@ Caveats:
   ([drbench](https://github.com/SeanPedersen/projection-benchmark)), and only two datasets have been tested so far.
 - **Stock NCVis was run with `min_dist` 0.1 and on the same RINND graph,** not with its own HNSW search.
 - **NCVis+ times were measured at a different time from the t-SNE times,** on the same host.
+- **The NCVis+ rows predate the block-of-8 kernel,** which makes the layout step 1.4× faster
+  (see below); end-to-end times have not been re-measured yet.
 - **How local is scored:** at 512k, and for NCVis+ at 100k, local is estimated on 10k fixed anchor
   points (ranks exact over all N). On stored t-SNE embeddings at 100k this matches exact scoring
   within 0.0005.
@@ -85,6 +88,20 @@ The tuning was done on 100k subsets and checked at 512k. Measured, per change:
 | `min_dist` 0.1 → 0.001 | local +0.012, free |
 | mean negatives per edge 5 → 10, learning rate 1 → 2 | local +0.012, ~1.5× layout time |
 | prefetching the negatives' rows | layout 1.5× faster at 36 threads, identical updates |
+| samples of an edge in blocks of 8 sharing one snapshot of the point and of Q | layout 1.4× faster; local −0.001 at equal settings |
+
+The blocks remove a serial chain: with per-sample updates each sample waits for the previous
+one's `powf`, `expf` and divisions. Layout time and quality at 36 threads, 3 seeds (jinaclip):
+
+| kernel, mean negatives | 100k time | 100k local / global | 512k time | 512k local / global |
+|---|---|---|---|---|
+| per-sample, 10 | 2.91 s | 0.9450 / 0.1740 | 14.07 s | 0.9560 / 0.1745 |
+| blocks of 8, 10 (default) | 2.13 s | 0.9443 / 0.1747 | 10.33 s | 0.9548 / 0.1742 |
+| blocks of 8, 13 | 2.72 s | 0.9472 / 0.1753 | 13.14 s | 0.9576 / 0.1745 |
+| blocks of 8, 14 | 2.96 s | 0.9482 / 0.1754 | 14.05 s | 0.9586 / 0.1748 |
+
+At the old kernel's time (`n_negative` 13–14) every score is equal or better. Peak RAM is
+unchanged (192 MB for the layout at 512k).
 
 Tried and dropped:
 
@@ -94,6 +111,9 @@ Tried and dropped:
 - **Moving only the edge's source point:** faster, but global drops to 0.12.
 - **Reordering points for cache locality:** no gain at 100k or 512k.
 - **NCVis's spectral init:** no better than random, and it costs time. It is removed.
+- **Other kernel tweaks:** write-intent prefetch, drawing negatives one or more edges ahead, and
+  `-march=native` (AVX-512) were neutral or slower. Blocks of 16 or whole edges are at most 3%
+  faster than 8 and lose more local quality.
 
 ## Parameters
 
@@ -102,7 +122,7 @@ Tried and dropped:
 | `n_components` | 2 | |
 | `n_neighbors` | 15 | kNN graph size |
 | `n_epochs` | 50 | |
-| `n_negative` | 10 | mean negative samples per edge (cubic ramp over epochs); the time/quality knob |
+| `n_negative` | 10 | mean negative samples per edge (cubic ramp over epochs); the time/quality knob. 13 costs about the old kernel's time at 10 and scores higher |
 | `min_dist`, `spread` | 0.001, 1.0 | kernel shape via (a, b), as in UMAP; or pass `a`, `b` directly |
 | `learning_rate` | 2.0 | |
 | `init` | `"pca"` | `"pca"`, `"random"` or an array [n, n_components] |
