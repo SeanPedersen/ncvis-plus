@@ -68,7 +68,7 @@ What the tables show:
 Caveats:
 
 - **Provenance of the scores:** they come from a separate benchmark
-  (drbench, `projection-benchmark`), and only two datasets have been tested so far.
+  ([drbench](https://github.com/SeanPedersen/projection-benchmark)), and only two datasets have been tested so far.
 - **Stock NCVis was run with `min_dist` 0.1 and on the same RINND graph,** not with its own HNSW search.
 - **NCVis+ times were measured at a different time from the t-SNE times,** on the same host.
 - **How local is scored:** at 512k, and for NCVis+ at 100k, local is estimated on 10k fixed anchor
