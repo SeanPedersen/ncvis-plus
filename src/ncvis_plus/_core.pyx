@@ -21,6 +21,8 @@ cdef extern from "ncvis.hpp" namespace "ncvis":
         uint64_t seed
         int n_threads
         vector[uint32_t] noise_plan
+        uint32_t local_epochs
+        float local_share, local_cell_points
 
     void c_hnsw_knn "ncvis::hnsw_knn"(const float *X, size_t n_points, size_t dim, size_t k,
                                       size_t M, size_t ef_construction, size_t ef_search,
@@ -43,7 +45,8 @@ def hnsw_knn(const float[:, ::1] X, size_t k, size_t M, size_t ef_construction, 
 
 
 def embed(const int64_t[:, ::1] knn, float[:, ::1] Y, float a, float b, float learning_rate,
-          float learning_rate_Q, const uint32_t[::1] noise_plan, uint64_t seed, int n_threads):
+          float learning_rate_Q, const uint32_t[::1] noise_plan, uint64_t seed, int n_threads,
+          uint32_t local_epochs=0, float local_share=0.99, float local_cell_points=64):
     """Symmetrize the kNN graph and optimize Y [n_points, dim] in place."""
     cdef LayoutParams params
     params.dim = Y.shape[1]
@@ -54,6 +57,9 @@ def embed(const int64_t[:, ::1] knn, float[:, ::1] Y, float a, float b, float le
     params.seed = seed
     params.n_threads = n_threads
     params.noise_plan.assign(&noise_plan[0], &noise_plan[0] + noise_plan.shape[0])
+    params.local_epochs = local_epochs
+    params.local_share = local_share
+    params.local_cell_points = local_cell_points
     cdef Graph graph
     with nogil:
         graph = c_symmetrize(&knn[0, 0], knn.shape[0], knn.shape[1], n_threads)

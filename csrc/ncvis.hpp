@@ -36,6 +36,12 @@ struct LayoutParams {
     uint64_t seed;
     int n_threads;
     std::vector<uint32_t> noise_plan; // negative samples per edge, one entry per epoch
+    // Local phase (2D/3D only): in the last `local_epochs` epochs a share `local_share` (< 1) of
+    // the negatives comes from the grid cells around the source point, with `local_cell_points`
+    // points per cell on average (see local_noise.hpp).
+    uint32_t local_epochs = 0;
+    float local_share = 0.99f;
+    float local_cell_points = 64.f;
 };
 
 // Optimizes Y [n_points, dim] in place, starting from its current values.

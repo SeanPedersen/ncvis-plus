@@ -9,7 +9,10 @@
 //   cross-core cache traffic (half of the loop's time in a profile at 100k x 36 threads);
 // - the samples of an edge are applied in blocks of 8 that share one snapshot of the source
 //   point and of Q, instead of one after the other: 1.4x faster layout at 100k-512k x 36 threads.
-//   At equal time (13-14 instead of 10 negatives) every quality score is equal or better.
+//   At equal time (13-14 instead of 10 negatives) every quality score is equal or better;
+// - in the last `local_epochs` epochs (2D/3D) negatives are drawn mostly from the grid cells around
+//   the source point and the mixture density enters the NCE ratio (local_noise.hpp): local
+//   trustworthiness above FFT t-SNE at 100k-512k, for +11-22% layout time.
 #include "ncvis.hpp"
 
 #include <omp.h>
@@ -20,6 +23,8 @@
 
 #include <hnswlib/hnswlib.h>
 #include <pcg_random.hpp>
+
+#include "local_noise.hpp"
 
 namespace ncvis {
 
@@ -128,8 +133,17 @@ struct Snapshot<0> {
     explicit Snapshot(size_t dim) : yi(dim), delta(dim) {}
 };
 
+// Grid layout for the local phase: compiled for 2D and 3D only (the runtime-dim path keeps
+// uniform noise throughout).
+template <size_t DIM>
+constexpr bool HAS_LOCAL_PHASE = DIM == 2 || DIM == 3;
+constexpr uint64_t GRID_STREAM = 1u << 20;  // pcg32 stream of the grid offsets, apart from threads'
+
 template <size_t DIM>
 void optimize_dim(const Graph &graph, float *Y, size_t n_points, const LayoutParams &params) {
+    constexpr size_t GRID_DIM = HAS_LOCAL_PHASE<DIM> ? DIM : 2;
+    using Grid = local_noise::Grid<GRID_DIM>;
+    using Block = local_noise::Block<GRID_DIM>;
     const size_t dim = DIM ? DIM : params.dim;
     const float a = params.a, b = params.b;
     const bool cauchy = (a == 1.f && b == 1.f);
@@ -144,12 +158,29 @@ void optimize_dim(const Graph &graph, float *Y, size_t n_points, const LayoutPar
     float Q = 0.f;
     float Q_sum = 0.f;
 
+    const int local_epochs = HAS_LOCAL_PHASE<DIM> ? (int)std::min<uint32_t>(params.local_epochs, n_epochs) : 0;
+    const int local_start = n_epochs - local_epochs;
+    const float local_share = params.local_share;
+    const float uniform_share = 1 - local_share;
+    const uint32_t local_threshold = (uint32_t)std::min(local_share * 4294967296.0, 4294967295.0);
+    const float n_points_f = (float)n_points;
+    Grid grid;
+    pcg32 grid_rng(params.seed, GRID_STREAM);
+    auto rebuild_grid = [&] {
+        if constexpr (HAS_LOCAL_PHASE<DIM>) {
+            local_noise::rebuild(grid, Y, n_points, params.local_cell_points, grid_rng);
+        }
+    };
+    if (local_epochs > 0 && local_start == 0) rebuild_grid();
+
 #pragma omp parallel num_threads(params.n_threads)
     {
         const int n_threads = omp_get_num_threads();
         pcg32 rng(params.seed, (uint64_t)omp_get_thread_num());
         const uint64_t n_points64 = n_points;
         std::vector<uint32_t> others(max_noise + 1);
+        std::vector<uint8_t> drawn_local(max_noise + 1);
+        std::vector<float> inv_density(max_noise + 1);  // 1 / (N p_noise(j | i)), uniform = 1
         Snapshot<DIM> snap(dim);
 
         for (int epoch = 0; epoch < n_epochs; ++epoch) {
@@ -157,22 +188,38 @@ void optimize_dim(const Graph &graph, float *Y, size_t n_points, const LayoutPar
             const float step = params.learning_rate * (1 - progress * progress);
             const uint32_t n_noise = params.noise_plan[epoch];
             const float inv_noise = n_noise ? 1.f / n_noise : 0.f;
+            const bool local = epoch >= local_start && n_noise != 0;
             float Q_local = Q;
 #pragma omp for nowait schedule(static)
             for (long long i = 0; i < (long long)n_points; ++i) {
                 float *yi = Y + (size_t)i * dim;
+                const Block block = local ? Block(grid, &grid.coords[(size_t)i * GRID_DIM]) : Block{};
+                const float local_density = local ? local_share * n_points_f / block.total : 0.f;
                 for (size_t edge = offsets[i]; edge < offsets[i + 1]; ++edge) {
                     if (edge + prefetch_ahead < n_edges) {
                         __builtin_prefetch(Y + (size_t)targets[edge + prefetch_ahead] * dim);
                     }
                     others[0] = targets[edge];
+                    drawn_local[0] = 0;
                     for (uint32_t s = 1; s <= n_noise; ++s) {
                         uint32_t other;
+                        bool from_block;
                         do {
-                            other = (uint32_t)(((uint64_t)rng() * n_points64) >> 32);
+                            from_block = local && rng() < local_threshold;
+                            other = from_block
+                                        ? grid.order[block.slot((uint32_t)(((uint64_t)rng() * block.total) >> 32))]
+                                        : (uint32_t)(((uint64_t)rng() * n_points64) >> 32);
                         } while (other == (uint32_t)i);
                         others[s] = other;
+                        drawn_local[s] = from_block;
                         __builtin_prefetch(Y + (size_t)other * dim);
+                        if (local && !from_block) __builtin_prefetch(&grid.coords[(size_t)other * GRID_DIM]);
+                    }
+                    if (local) {
+                        for (uint32_t s = 0; s <= n_noise; ++s) {
+                            const bool near = drawn_local[s] || block.contains(&grid.coords[(size_t)others[s] * GRID_DIM]);
+                            inv_density[s] = 1 / ((near ? local_density : 0.f) + uniform_share);
+                        }
                     }
                     for (uint32_t block = 0; block <= n_noise; block += SNAPSHOT_BLOCK) {
                         const uint32_t block_end = std::min(block + SNAPSHOT_BLOCK, n_noise + 1);
@@ -201,7 +248,8 @@ void optimize_dim(const Graph &graph, float *Y, size_t n_points, const LayoutPar
                             }
                             float w = 1.f;  // no negatives this epoch: plain attraction
                             if (n_noise != 0) {
-                                const float ratio = q * noise_scale;
+                                float ratio = q * noise_scale;
+                                if (local) ratio *= inv_density[s];
                                 w = (s == 0) ? 1 / (1 + ratio) : -ratio / (1 + ratio);
                                 w_sum += w;
                                 w *= kernel_grad;
@@ -227,6 +275,7 @@ void optimize_dim(const Graph &graph, float *Y, size_t n_points, const LayoutPar
             {
                 Q = Q_sum / n_threads;
                 Q_sum = 0.f;
+                if (local_epochs > 0 && epoch + 1 >= local_start && epoch + 1 < n_epochs) rebuild_grid();
             }
         }
     }

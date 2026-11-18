@@ -53,12 +53,24 @@ def test_single_thread_is_deterministic(blobs):
 
 
 @pytest.mark.parametrize("options", [{"init": "random"}, {"metric": "cosine"}, {"a": 1.0, "b": 1.0},
-                                     {"n_components": 3}])
+                                     {"n_components": 3}, {"n_components": 4}, {"local_epochs": 50},
+                                     {"local_share": 0.0}, {"local_cell_points": 1}])
 def test_options_produce_finite_layouts(blobs, options):
     X, _ = blobs
     Y = NCVisPlus(n_jobs=THREADS, random_state=0, **options).fit_transform(X)
     assert Y.shape == (N_POINTS, options.get("n_components", 2))
     assert np.isfinite(Y).all()
+
+
+@pytest.mark.parametrize("n_components", [2, 3])
+def test_local_phase_is_deterministic_and_sharpens_neighbourhoods(blobs, n_components):
+    X, _ = blobs
+    options ={"knn": "hnsw", "n_components": n_components, "n_jobs": 1, "random_state": 2}
+    uniform = NCVisPlus(local_epochs=0, **options).fit_transform(X)
+    local = NCVisPlus(**options).fit_transform(X)
+    assert np.array_equal(local, NCVisPlus(**options).fit_transform(X))
+    assert not np.array_equal(local, uniform)
+    assert trustworthiness(X, local, n_neighbors=10) >= trustworthiness(X, uniform, n_neighbors=10)
 
 
 def test_array_init_is_used(blobs):
@@ -69,7 +81,8 @@ def test_array_init_is_used(blobs):
 
 
 @pytest.mark.parametrize("options", [{"knn": "annoy"}, {"init": "spectral"}, {"a": 1.0},
-                                     {"metric": "manhattan"}])
+                                     {"metric": "manhattan"}, {"local_epochs": -1}, {"local_share": 1.0},
+                                     {"local_cell_points": 0}])
 def test_invalid_options_raise(blobs, options):
     X, _ = blobs
     with pytest.raises(ValueError):
