@@ -1,7 +1,7 @@
 # CLAUDE.md
 
 NCVis+: fork of NCVis 1.5.13 (noise-contrastive 2D projection) with PCA init, retuned defaults, a
-prefetching layout kernel with a local-noise final phase and RINND kNN graphs. Python 3.12 + uv; C++17 core via Cython.
+prefetching layout kernel with a local-noise final phase and RINND kNN graphs. Python 3.11+ (uv); C++17 core via Cython.
 
 ## Commands
 - Build and test on hartmut, not locally: `uv sync`, `uv run pytest` (33 tests), `uv run ruff check src tests`.

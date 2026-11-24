@@ -177,7 +177,7 @@ Tried and dropped:
 ## Install and develop
 
 ```sh
-uv sync                 # Python 3.12; builds the C++ core (needs a C++17 compiler with OpenMP)
+uv sync                 # Python 3.11+; builds the C++ core (needs a C++17 compiler with OpenMP)
 uv run pytest
 uv run ruff check src tests
 uv sync --reinstall-package ncvis-plus   # after editing csrc/ or _core.pyx
